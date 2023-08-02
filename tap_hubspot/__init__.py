@@ -883,9 +883,11 @@ def sync_paginated_records(stream_id,
 
     params = {
         'limit': limit,
-        'properties': get_selected_property_fields(catalog, mdata),
         'archived': False
     }
+    
+    if stream_id != "goal_targets":
+        params['properties'] = get_selected_property_fields(catalog, mdata),
     
     if associations:
         params['associations'] = associations
