@@ -849,7 +849,7 @@ def gen_request_page(tap_stream_id, url, params, path, more_key):
 
 
 def sync_tickets(STATE, ctx):
-    return sync_paginated_records(strean_id="tickets",
+    return sync_paginated_records(stream_id="tickets",
                                   primary_key="id",
                                   bookmark_key="updatedAt",
                                   associations='contact,company,deals',
@@ -857,7 +857,7 @@ def sync_tickets(STATE, ctx):
                                   ctx=ctx)
 
 def sync_goal_targets(STATE, ctx):
-    return sync_paginated_records(strean_id="goal_targets",
+    return sync_paginated_records(stream_id="goal_targets",
                                   primary_key="id",
                                   bookmark_key="updatedAt",
                                   associations=None,
@@ -886,7 +886,7 @@ def sync_paginated_records(stream_id,
         'properties': get_selected_property_fields(catalog, mdata),
         'archived': False
     }
-
+    
     if associations:
         params['associations'] = associations
 
