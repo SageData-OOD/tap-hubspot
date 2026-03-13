@@ -165,9 +165,14 @@ class TestClient():
             for record in records:
                 for column in record.keys():
                     if column in datetime_columns[stream]:
-                        record[column] = self.BaseTest.datetime_from_timestamp(
-                            record[column] / 1000, self.BOOKMARK_DATE_FORMAT
-                        )
+                        if isinstance(record[column], str):
+                            record[column] = datetime.datetime.strptime(
+                                record[column], '%Y-%m-%dT%H:%M:%S.%fZ'
+                            ).strftime(self.BOOKMARK_DATE_FORMAT)
+                        else:
+                            record[column] = self.BaseTest.datetime_from_timestamp(
+                                record[column] / 1000, self.BOOKMARK_DATE_FORMAT
+                            )
 
         LOGGER.info(
             f"TEST CLIENT | Transforming (datatype conversions) {len(records)} {stream} records")
@@ -601,9 +606,37 @@ class TestClient():
         """
         Get all owners.
         """
-        url = f"{BASE_URL}/owners/v2/owners"
-        records = self.get(url)
-        transformed_records = self.datatype_transformations('owners', records)
+        url = f"{BASE_URL}/crm/v3/owners"
+        params = {'limit': 100}
+        records = []
+
+        while True:
+            response = self.get(url, params=params)
+            records.extend(response['results'])
+            if not response.get('paging'):
+                break
+            params['after'] = response.get('paging').get('next').get('after')
+
+        normalized_records = []
+        for record in records:
+            normalized_records.append({
+                'portalId': None,
+                'ownerId': int(record['id']),
+                'type': record.get('type'),
+                'firstName': record.get('firstName'),
+                'lastName': record.get('lastName'),
+                'email': record.get('email'),
+                'createdAt': record.get('createdAt'),
+                'signature': None,
+                'updatedAt': record.get('updatedAt'),
+                'hasContactsAccess': None,
+                'isActive': not record['archived'],
+                'activeUserId': record.get('userId'),
+                'userIdIncludingInactive': record.get('userIdIncludingInactive'),
+                'remoteList': [],
+            })
+
+        transformed_records = self.datatype_transformations('owners', normalized_records)
         return transformed_records
 
     def get_subscription_changes(self, since=''):

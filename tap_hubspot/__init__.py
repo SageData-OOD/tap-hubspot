@@ -106,7 +106,7 @@ ENDPOINTS = {
     "contact_lists":        "/contacts/v1/lists",
     "forms":                "/forms/v2/forms",
     "workflows":            "/automation/v3/workflows",
-    "owners":               "/owners/v2/owners",
+    "owners":               "/crm/v3/owners",
 
     "tickets_properties":   "/crm/v3/properties/tickets",
     "tickets":              "/crm/v4/objects/tickets",
@@ -848,6 +848,29 @@ def gen_request_page(tap_stream_id, url, params, path, more_key):
             params['after'] = data.get(more_key).get('next').get('after')
 
 
+def _transform_owner_record(row):
+    owner_id = row.get('id')
+    user_id = row.get('userId')
+    archived = row.get('archived')
+
+    return {
+        'portalId': None,
+        'ownerId': int(owner_id) if owner_id is not None else None,
+        'type': row.get('type'),
+        'firstName': row.get('firstName'),
+        'lastName': row.get('lastName'),
+        'email': row.get('email'),
+        'createdAt': row.get('createdAt'),
+        'signature': None,
+        'updatedAt': row.get('updatedAt'),
+        'hasContactsAccess': None,
+        'isActive': None if archived is None else not archived,
+        'activeUserId': user_id,
+        'userIdIncludingInactive': row.get('userIdIncludingInactive'),
+        'remoteList': [],
+    }
+
+
 def sync_tickets(STATE, ctx):
     return sync_paginated_records(stream_id="tickets",
                                   primary_key="id",
@@ -1212,26 +1235,24 @@ def sync_owners(STATE, ctx):
 
     LOGGER.info("sync_owners from %s", start)
 
-    params = {}
-    if CONFIG.get('include_inactives'):
-        params['includeInactives'] = "true"
-    data = request(get_url("owners"), params).json()
-
     time_extracted = utils.now()
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
         # To handle records updated between start of the table sync and the end,
         # store the current sync start in the state and not move the bookmark past this value.
         sync_start_time = utils.now()
-        for row in data:
-            record = bumble_bee.transform(
-                lift_properties_and_versions(row), schema, mdata)
-            if record[bookmark_key] >= max_bk_value:
-                max_bk_value = record[bookmark_key]
+        owner_sets = [False, True] if CONFIG.get('include_inactives') else [False]
+        for archived in owner_sets:
+            params = {'archived': archived, 'limit': 100}
+            for row in gen_request_page('owners', get_url("owners"), params, 'results', "paging"):
+                record = bumble_bee.transform(
+                    _transform_owner_record(row), schema, mdata)
+                if record[bookmark_key] >= max_bk_value:
+                    max_bk_value = record[bookmark_key]
 
-            if record[bookmark_key] >= start:
-                singer.write_record("owners", record, catalog.get(
-                    'stream_alias'), time_extracted=time_extracted)
+                if record[bookmark_key] >= start:
+                    singer.write_record("owners", record, catalog.get(
+                        'stream_alias'), time_extracted=time_extracted)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), sync_start_time)
