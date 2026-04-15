@@ -42,3 +42,7 @@ class TestGetStreamsToSync(unittest.TestCase):
     def test_parse_source_from_url_succeeds(self):
         url = "https://api.hubapi.com/companies/v2/companies/recent/modified"
         self.assertEqual('companies', parse_source_from_url(url))
+
+    def test_parse_source_from_url_engagements_recent(self):
+        url = "https://api.hubapi.com/engagements/v1/engagements/recent/modified"
+        self.assertEqual('engagements', parse_source_from_url(url))

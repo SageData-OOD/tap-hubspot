@@ -24,8 +24,8 @@ class Offsets(unittest.TestCase):
         STATE = utils.get_clear_state()
         catalog = {'stream_alias': 'hubspot_companies'}
 
-        #change count = 1
-        tap_hubspot.default_company_params['limit'] = 1
+        # change page size to 1 (recent/modified uses `count`)
+        tap_hubspot.default_company_params['count'] = 1
 
         try:
             STATE = tap_hubspot.sync_companies(STATE, catalog)
@@ -49,8 +49,8 @@ class Offsets(unittest.TestCase):
         #no bookmark though
         self.assertEqual(utils.caught_state['bookmarks']['companies']['hs_lastmodifieddate'], None)
 
-        #change count back to 250
-        tap_hubspot.default_company_params['limit'] = 250
+        # restore default page size for recent/modified
+        tap_hubspot.default_company_params['count'] = 100
 
         #call do_sync and verify:
         #    1)sync_companies is called first

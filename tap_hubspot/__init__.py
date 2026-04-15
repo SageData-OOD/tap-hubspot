@@ -100,6 +100,7 @@ ENDPOINTS = {
     "campaigns_detail":     "/email/public/v1/campaigns/{campaign_id}",
 
     "engagements_all":        "/engagements/v1/engagements/paged",
+    "engagements_recent":     "/engagements/v1/engagements/recent/modified",
 
     "subscription_changes": "/email/public/v1/subscriptions/timeline",
     "email_events":         "/email/public/v1/events",
@@ -381,7 +382,7 @@ def request(url, params=None):
 
     req = requests.Request('GET', url, params=params,
                            headers=headers).prepare()
-    LOGGER.info("GET %s", req.url)
+    LOGGER.debug("GET %s", req.url)
     with metrics.http_request_timer(parse_source_from_url(url)) as timer:
         resp = SESSION.send(req, timeout=get_request_timeout())
         timer.tags[metrics.Tag.http_status_code] = resp.status_code
@@ -649,7 +650,10 @@ def _sync_contacts_by_company(STATE, ctx, company_id):
 
 
 default_company_params = {
-    'limit': 250, 'properties': ["createdate", "hs_lastmodifieddate"]
+    'limit': 250,
+    # Page size for companies recent/modified list (HubSpot max 100).
+    'count': 100,
+    'properties': ["createdate", "hs_lastmodifieddate"],
 }
 
 
@@ -662,7 +666,6 @@ def sync_companies(STATE, ctx):
 
     start = utils.strptime_to_utc(get_start(
         STATE, "companies", bookmark_key, older_bookmark_key=bookmark_field_in_record))
-    LOGGER.info("sync_companies from %s", start)
     schema = load_schema('companies')
     singer.write_schema("companies", schema, ["companyId"], [
                         bookmark_key], catalog.get('stream_alias'))
@@ -678,15 +681,33 @@ def sync_companies(STATE, ctx):
     STATE = write_current_sync_start(STATE, "companies", current_sync_start)
     singer.write_state(STATE)
 
-    url = get_url("companies_all")
+    # List companies via recent/modified + `since` (bookmark / start_date), not full paged scan.
+    # HubSpot may cap this endpoint at ~10k results per sync window.
+    url = get_url("companies_recent")
+    since_ms = int(start.timestamp() * 1000)
+    list_params = {
+        'since': since_ms,
+        'count': default_company_params['count'],
+        'properties': list(default_company_params['properties']),
+    }
+    LOGGER.info(
+        "sync_companies: fetching company list from recent/modified endpoint %s "
+        "since=%s (%d ms) count=%d",
+        url,
+        utils.strftime(start),
+        since_ms,
+        list_params['count'],
+    )
     max_bk_value = start
     if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
         contacts_by_company_schema = load_schema(CONTACTS_BY_COMPANY)
         singer.write_schema("contacts_by_company", contacts_by_company_schema, [
                             "company-id", "contact-id"])
 
+    companies_list_rows = 0
     with bumble_bee:
-        for row in gen_request(STATE, 'companies', url, default_company_params, 'companies', 'has-more', ['offset'], ['offset']):
+        for row in gen_request(STATE, 'companies', url, list_params, 'companies', 'has-more', ['offset'], ['offset']):
+            companies_list_rows += 1
             row_properties = row['properties']
             modified_time = None
             if bookmark_field_in_record in row_properties:
@@ -713,6 +734,11 @@ def sync_companies(STATE, ctx):
                 if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
                     STATE = _sync_contacts_by_company(
                         STATE, ctx, record['companyId'])
+
+    LOGGER.info(
+        "sync_companies: recent/modified list returned %d company row(s) across all pages",
+        companies_list_rows,
+    )
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(max_bk_value, current_sync_start)
@@ -1271,36 +1297,48 @@ def sync_engagements(STATE, ctx):
                         bookmark_key], catalog.get('stream_alias'))
     start = get_start(STATE, "engagements", bookmark_key)
 
-    # Because this stream doesn't query by `lastUpdated`, it cycles
-    # through the data set every time. The issue with this is that there
-    # is a race condition by which records may be updated between the
-    # start of this table's sync and the end, causing some updates to not
-    # be captured, in order to combat this, we must store the current
-    # sync's start in the state and not move the bookmark past this value.
+    # Bookmark is capped at sync start to avoid missing updates that occur during the run.
     current_sync_start = get_current_sync_start(
         STATE, "engagements") or utils.now()
     STATE = write_current_sync_start(STATE, "engagements", current_sync_start)
     singer.write_state(STATE)
 
     max_bk_value = start
-    LOGGER.info("sync_engagements from %s", start)
 
     STATE = singer.write_bookmark(STATE, 'engagements', bookmark_key, start)
     singer.write_state(STATE)
 
-    url = get_url("engagements_all")
-    params = {'limit': int(CONFIG.get('engagements_page_size') or 190)}
+    page_size = int(CONFIG.get('engagements_page_size') or 190)
+    start_dt = utils.strptime_with_tz(start)
+    url = get_url("engagements_recent")
+    since_ms = int(start_dt.timestamp() * 1000)
+    params = {
+        'since': since_ms,
+        'limit': page_size,
+    }
+    LOGGER.info(
+        "sync_engagements: fetching from recent/modified endpoint %s "
+        "since=%s (%d ms) limit=%d",
+        url,
+        utils.strftime(start_dt),
+        since_ms,
+        params['limit'],
+    )
     top_level_key = "results"
     engagements = gen_request(STATE, 'engagements', url, params,
                               top_level_key, "hasMore", ["offset"], ["offset"])
 
     time_extracted = utils.now()
 
+    engagements_list_rows = 0
+    engagements_emitted = 0
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
         for engagement in engagements:
+            engagements_list_rows += 1
             record = bumble_bee.transform(
                 lift_properties_and_versions(engagement), schema, mdata)
             if record['engagement'][bookmark_key] >= start:
+                engagements_emitted += 1
                 # hoist PK and bookmark field to top-level record
                 record['engagement_id'] = record['engagement']['id']
                 record[bookmark_key] = record['engagement'][bookmark_key]
@@ -1308,6 +1346,13 @@ def sync_engagements(STATE, ctx):
                     'stream_alias'), time_extracted=time_extracted)
                 if record['engagement'][bookmark_key] >= max_bk_value:
                     max_bk_value = record['engagement'][bookmark_key]
+
+    LOGGER.info(
+        "sync_engagements: recent/modified returned %d engagement row(s) across all pages; "
+        "%d record(s) emitted after bookmark filter",
+        engagements_list_rows,
+        engagements_emitted,
+    )
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), current_sync_start)
