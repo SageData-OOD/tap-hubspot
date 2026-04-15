@@ -83,6 +83,7 @@ ENDPOINTS = {
     "companies_properties": "/companies/v2/properties",
     "companies_all":        "/companies/v2/companies/paged",
     "companies_recent":     "/companies/v2/companies/recent/modified",
+    "companies_search":     "/crm/v3/objects/companies/search",
     "companies_detail":     "/companies/v2/companies/{company_id}",
     "contacts_by_company":  "/companies/v2/companies/{company_id}/vids",
 
@@ -101,6 +102,7 @@ ENDPOINTS = {
 
     "engagements_all":        "/engagements/v1/engagements/paged",
     "engagements_recent":     "/engagements/v1/engagements/recent/modified",
+    "engagements_detail":     "/engagements/v1/engagements/{engagement_id}",
 
     "subscription_changes": "/email/public/v1/subscriptions/timeline",
     "email_events":         "/email/public/v1/events",
@@ -178,6 +180,55 @@ def get_url(endpoint, **kwargs):
         raise ValueError("Invalid endpoint {}".format(endpoint))
 
     return BASE_URL + ENDPOINTS[endpoint].format(**kwargs)
+
+
+# CRM v3 search for engagements: each type shares legacy GET /engagements/v1/engagements/{id}
+ENGAGEMENT_V3_SEARCH_OBJECT_TYPES = (
+    'notes', 'tasks', 'calls', 'emails', 'meetings')
+
+
+def _crm_v3_object_search_url(object_type):
+    return "{}/crm/v3/objects/{}/search".format(BASE_URL, object_type)
+
+
+def _parse_v3_hs_lastmodified(props):
+    """Parse hs_lastmodifieddate from flattened CRM v3 `properties` dict."""
+    if not props:
+        return None
+    val = props.get('hs_lastmodifieddate')
+    if val:
+        return utils.strptime_to_utc(val)
+    return None
+
+
+def _parse_v3_createdate(props):
+    if not props:
+        return None
+    val = props.get('createdate')
+    if val:
+        return utils.strptime_to_utc(val)
+    return None
+
+
+def _clear_legacy_company_paged_offset(STATE):
+    """Drop offset from GET /companies/v2/companies/paged; not valid for CRM v3 search."""
+    saved = singer.get_offset(STATE, 'companies') or {}
+    if 'offset' in saved and 'after' not in saved:
+        LOGGER.warning(
+            "Clearing legacy companies paged list offset; using CRM v3 search pagination")
+        STATE = singer.clear_offset(STATE, 'companies')
+        singer.write_state(STATE)
+    return STATE
+
+
+def _clear_legacy_engagement_v1_offset(STATE):
+    saved = singer.get_offset(STATE, 'engagements') or {}
+    if 'offset' in saved and 'after' not in saved:
+        LOGGER.warning(
+            "Clearing legacy engagements v1 paged offset; using CRM v3 search")
+        STATE = singer.clear_offset(STATE, 'engagements')
+        singer.write_state(STATE)
+    return STATE
 
 
 def get_field_type_schema(field_type):
@@ -651,8 +702,8 @@ def _sync_contacts_by_company(STATE, ctx, company_id):
 
 default_company_params = {
     'limit': 250,
-    # Page size for companies recent/modified list (HubSpot max 100).
-    'count': 100,
+    # CRM v3 POST /crm/v3/objects/companies/search (max 200)
+    'search_limit': 200,
     'properties': ["createdate", "hs_lastmodifieddate"],
 }
 
@@ -681,22 +732,16 @@ def sync_companies(STATE, ctx):
     STATE = write_current_sync_start(STATE, "companies", current_sync_start)
     singer.write_state(STATE)
 
-    # List companies via recent/modified + `since` (bookmark / start_date), not full paged scan.
-    # HubSpot may cap this endpoint at ~10k results per sync window.
-    url = get_url("companies_recent")
-    since_ms = int(start.timestamp() * 1000)
-    list_params = {
-        'since': since_ms,
-        'count': default_company_params['count'],
-        'properties': list(default_company_params['properties']),
-    }
+    STATE = _clear_legacy_company_paged_offset(STATE)
+    filter_ms = str(int(start.timestamp() * 1000))
+    search_limit = int(
+        CONFIG.get('companies_search_limit')
+        or default_company_params.get('search_limit', 200))
+    search_url = get_url("companies_search")
     LOGGER.info(
-        "sync_companies: fetching company list from recent/modified endpoint %s "
-        "since=%s (%d ms) count=%d",
-        url,
-        utils.strftime(start),
-        since_ms,
-        list_params['count'],
+        "sync_companies: CRM v3 POST companies/search hs_lastmodifieddate GTE %s ms limit=%d",
+        filter_ms,
+        search_limit,
     )
     max_bk_value = start
     if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
@@ -706,37 +751,64 @@ def sync_companies(STATE, ctx):
 
     companies_list_rows = 0
     with bumble_bee:
-        for row in gen_request(STATE, 'companies', url, list_params, 'companies', 'has-more', ['offset'], ['offset']):
-            companies_list_rows += 1
-            row_properties = row['properties']
-            modified_time = None
-            if bookmark_field_in_record in row_properties:
-                # Hubspot returns timestamps in millis
-                timestamp_millis = row_properties[bookmark_field_in_record]['timestamp'] / 1000.0
-                modified_time = datetime.datetime.fromtimestamp(
-                    timestamp_millis, datetime.timezone.utc)
-            elif 'createdate' in row_properties:
-                # Hubspot returns timestamps in millis
-                timestamp_millis = row_properties['createdate']['timestamp'] / 1000.0
-                modified_time = datetime.datetime.fromtimestamp(
-                    timestamp_millis, datetime.timezone.utc)
+        saved = singer.get_offset(STATE, 'companies') or {}
+        after = saved.get('after')
+        while True:
+            body = {
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": "hs_lastmodifieddate",
+                        "operator": "GTE",
+                        "value": filter_ms
+                    }]
+                }],
+                "limit": search_limit,
+                "properties": ["hs_lastmodifieddate", "createdate"],
+                "sorts": [{
+                    "propertyName": "hs_lastmodifieddate",
+                    "direction": "ASCENDING"
+                }],
+            }
+            if after:
+                body["after"] = after
+            resp = post_search_endpoint(search_url, body)
+            data = resp.json()
+            results = data.get('results') or []
+            with metrics.record_counter('companies') as counter:
+                for row in results:
+                    counter.increment()
+                    companies_list_rows += 1
+                    company_id = int(row['id'])
+                    props = row.get('properties') or {}
+                    modified_time = _parse_v3_hs_lastmodified(
+                        props) or _parse_v3_createdate(props)
 
-            if modified_time and modified_time >= max_bk_value:
-                max_bk_value = modified_time
+                    if modified_time and modified_time >= max_bk_value:
+                        max_bk_value = modified_time
 
-            if not modified_time or modified_time >= start:
-                record = request(get_url("companies_detail",
-                                 company_id=row['companyId'])).json()
-                record = bumble_bee.transform(
-                    lift_properties_and_versions(record), schema, mdata)
-                singer.write_record("companies", record, catalog.get(
-                    'stream_alias'), time_extracted=utils.now())
-                if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
-                    STATE = _sync_contacts_by_company(
-                        STATE, ctx, record['companyId'])
+                    if not modified_time or modified_time >= start:
+                        record = request(get_url("companies_detail"),
+                                         company_id=company_id).json()
+                        record = bumble_bee.transform(
+                            lift_properties_and_versions(record), schema, mdata)
+                        singer.write_record("companies", record, catalog.get(
+                            'stream_alias'), time_extracted=utils.now())
+                        if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
+                            STATE = _sync_contacts_by_company(
+                                STATE, ctx, record['companyId'])
+
+            paging = data.get('paging') or {}
+            next_after = paging.get('next', {}).get('after')
+            if not next_after:
+                STATE = singer.clear_offset(STATE, 'companies')
+                singer.write_state(STATE)
+                break
+            after = next_after
+            STATE = singer.set_offset(STATE, 'companies', 'after', after)
+            singer.write_state(STATE)
 
     LOGGER.info(
-        "sync_companies: recent/modified list returned %d company row(s) across all pages",
+        "sync_companies: CRM v3 search returned %d company row(s) across all pages",
         companies_list_rows,
     )
 
@@ -1308,51 +1380,127 @@ def sync_engagements(STATE, ctx):
     STATE = singer.write_bookmark(STATE, 'engagements', bookmark_key, start)
     singer.write_state(STATE)
 
-    page_size = int(CONFIG.get('engagements_page_size') or 190)
+    STATE = _clear_legacy_engagement_v1_offset(STATE)
     start_dt = utils.strptime_with_tz(start)
-    url = get_url("engagements_recent")
-    since_ms = int(start_dt.timestamp() * 1000)
-    params = {
-        'since': since_ms,
-        'limit': page_size,
-    }
+    filter_ms = str(int(start_dt.timestamp() * 1000))
+    search_limit = int(
+        CONFIG.get('engagements_search_limit')
+        or CONFIG.get('engagements_page_size')
+        or 200)
+
+    cursor_raw = singer.get_bookmark(STATE, 'engagements', 'search_cursor')
+    cursor = None
+    if cursor_raw:
+        try:
+            cursor = json.loads(cursor_raw)
+        except (json.JSONDecodeError, TypeError):
+            LOGGER.warning("Ignoring invalid engagements search_cursor in state")
+
+    resume_after = None
+    if cursor and isinstance(cursor, dict):
+        try:
+            start_type_idx = ENGAGEMENT_V3_SEARCH_OBJECT_TYPES.index(
+                cursor['object_type'])
+            resume_after = cursor.get('after')
+        except (ValueError, KeyError, TypeError):
+            start_type_idx = 0
+            resume_after = None
+    else:
+        start_type_idx = 0
+
     LOGGER.info(
-        "sync_engagements: fetching from recent/modified endpoint %s "
-        "since=%s (%d ms) limit=%d",
-        url,
-        utils.strftime(start_dt),
-        since_ms,
-        params['limit'],
+        "sync_engagements: CRM v3 search per activity type + v1 detail; "
+        "hs_lastmodifieddate GTE %s ms limit=%d",
+        filter_ms,
+        search_limit,
     )
-    top_level_key = "results"
-    engagements = gen_request(STATE, 'engagements', url, params,
-                              top_level_key, "hasMore", ["offset"], ["offset"])
 
     time_extracted = utils.now()
-
     engagements_list_rows = 0
     engagements_emitted = 0
+
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
-        for engagement in engagements:
-            engagements_list_rows += 1
-            record = bumble_bee.transform(
-                lift_properties_and_versions(engagement), schema, mdata)
-            if record['engagement'][bookmark_key] >= start:
-                engagements_emitted += 1
-                # hoist PK and bookmark field to top-level record
-                record['engagement_id'] = record['engagement']['id']
-                record[bookmark_key] = record['engagement'][bookmark_key]
-                singer.write_record("engagements", record, catalog.get(
-                    'stream_alias'), time_extracted=time_extracted)
-                if record['engagement'][bookmark_key] >= max_bk_value:
-                    max_bk_value = record['engagement'][bookmark_key]
+        for type_idx in range(start_type_idx, len(ENGAGEMENT_V3_SEARCH_OBJECT_TYPES)):
+            object_type = ENGAGEMENT_V3_SEARCH_OBJECT_TYPES[type_idx]
+            after = resume_after if type_idx == start_type_idx else None
+            resume_after = None
+            search_url = _crm_v3_object_search_url(object_type)
+            while True:
+                body = {
+                    "filterGroups": [{
+                        "filters": [{
+                            "propertyName": "hs_lastmodifieddate",
+                            "operator": "GTE",
+                            "value": filter_ms
+                        }]
+                    }],
+                    "limit": search_limit,
+                    "properties": ["hs_lastmodifieddate"],
+                    "sorts": [{
+                        "propertyName": "hs_lastmodifieddate",
+                        "direction": "ASCENDING"
+                    }],
+                }
+                if after:
+                    body["after"] = after
+                try:
+                    resp = post_search_endpoint(search_url, body)
+                except requests.exceptions.HTTPError as err:
+                    if err.response is not None and err.response.status_code == 400:
+                        LOGGER.warning(
+                            "CRM v3 search skipped for object type %s: %s",
+                            object_type, err)
+                        break
+                    raise
+                data = resp.json()
+                results = data.get('results') or []
+                with metrics.record_counter('engagements') as counter:
+                    for r in results:
+                        counter.increment()
+                        engagements_list_rows += 1
+                        eid = int(r['id'])
+                        detail_url = get_url('engagements_detail', engagement_id=eid)
+                        try:
+                            engagement = request(detail_url).json()
+                        except requests.exceptions.HTTPError as err:
+                            if err.response is not None and err.response.status_code in (400, 404):
+                                LOGGER.warning(
+                                    "Skipping engagement id=%s (no v1 record): %s",
+                                    eid, err)
+                                continue
+                            raise
+                        record = bumble_bee.transform(
+                            lift_properties_and_versions(engagement), schema, mdata)
+                        if record['engagement'][bookmark_key] >= start:
+                            engagements_emitted += 1
+                            record['engagement_id'] = record['engagement']['id']
+                            record[bookmark_key] = record['engagement'][bookmark_key]
+                            singer.write_record("engagements", record, catalog.get(
+                                'stream_alias'), time_extracted=time_extracted)
+                            if record['engagement'][bookmark_key] >= max_bk_value:
+                                max_bk_value = record['engagement'][bookmark_key]
+
+                paging = data.get('paging') or {}
+                next_after = paging.get('next', {}).get('after')
+                if not next_after:
+                    break
+                after = next_after
+                STATE = singer.write_bookmark(
+                    STATE, 'engagements', 'search_cursor',
+                    json.dumps({
+                        'object_type': object_type,
+                        'after': after
+                    }))
+                singer.write_state(STATE)
 
     LOGGER.info(
-        "sync_engagements: recent/modified returned %d engagement row(s) across all pages; "
+        "sync_engagements: CRM v3 search + v1 detail processed %d row(s); "
         "%d record(s) emitted after bookmark filter",
         engagements_list_rows,
         engagements_emitted,
     )
+
+    STATE = singer.write_bookmark(STATE, 'engagements', 'search_cursor', None)
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
     new_bookmark = min(utils.strptime_to_utc(max_bk_value), current_sync_start)

@@ -24,8 +24,8 @@ class Offsets(unittest.TestCase):
         STATE = utils.get_clear_state()
         catalog = {'stream_alias': 'hubspot_companies'}
 
-        # change page size to 1 (recent/modified uses `count`)
-        tap_hubspot.default_company_params['count'] = 1
+        # one CRM v3 search result per page (resume / offset test)
+        tap_hubspot.default_company_params['search_limit'] = 1
 
         try:
             STATE = tap_hubspot.sync_companies(STATE, catalog)
@@ -49,8 +49,8 @@ class Offsets(unittest.TestCase):
         #no bookmark though
         self.assertEqual(utils.caught_state['bookmarks']['companies']['hs_lastmodifieddate'], None)
 
-        # restore default page size for recent/modified
-        tap_hubspot.default_company_params['count'] = 100
+        # restore default CRM v3 search page size
+        tap_hubspot.default_company_params['search_limit'] = 200
 
         #call do_sync and verify:
         #    1)sync_companies is called first
