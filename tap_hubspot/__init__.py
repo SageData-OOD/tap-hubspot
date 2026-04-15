@@ -787,8 +787,9 @@ def sync_companies(STATE, ctx):
                         max_bk_value = modified_time
 
                     if not modified_time or modified_time >= start:
-                        record = request(get_url("companies_detail"),
-                                         company_id=company_id).json()
+                        record = request(
+                            get_url("companies_detail", company_id=company_id)
+                        ).json()
                         record = bumble_bee.transform(
                             lift_properties_and_versions(record), schema, mdata)
                         singer.write_record("companies", record, catalog.get(
