@@ -5,6 +5,7 @@ import itertools
 import os
 import re
 import sys
+import time
 import json
 # pylint: disable=import-error
 import attr
@@ -72,6 +73,9 @@ CONFIG = {
     "start_date": None,
     "hapikey": None,
     "include_inactives": None,
+    # Log INFO progress every N company detail fetches / engagement rows (0 = off)
+    "companies_progress_log_interval": 50,
+    "engagements_progress_log_interval": 100,
 }
 
 ENDPOINTS = {
@@ -210,6 +214,18 @@ def _parse_v3_createdate(props):
     return None
 
 
+def _max_hs_lastmodified_ms_from_v3_results(results):
+    """Max hs_lastmodifieddate (ms since epoch) from CRM v3 search result rows."""
+    max_ms = None
+    for row in results:
+        props = row.get('properties') or {}
+        dt = _parse_v3_hs_lastmodified(props) or _parse_v3_createdate(props)
+        if dt is not None:
+            ms = int(dt.timestamp() * 1000)
+            max_ms = ms if max_ms is None else max(max_ms, ms)
+    return max_ms
+
+
 def _clear_legacy_company_paged_offset(STATE):
     """Drop offset from GET /companies/v2/companies/paged; not valid for CRM v3 search."""
     saved = singer.get_offset(STATE, 'companies') or {}
@@ -217,6 +233,20 @@ def _clear_legacy_company_paged_offset(STATE):
         LOGGER.warning(
             "Clearing legacy companies paged list offset; using CRM v3 search pagination")
         STATE = singer.clear_offset(STATE, 'companies')
+        singer.write_state(STATE)
+    return STATE
+
+
+def _repair_company_search_cursor_without_segment_max(STATE):
+    """HubSpot search cursor without segment_max_ms cannot recover from the ~10k page limit."""
+    saved = singer.get_offset(STATE, 'companies') or {}
+    if saved.get('after') and saved.get('segment_max_ms') is None:
+        LOGGER.warning(
+            "Clearing bookmarks.companies.offset.after (missing segment_max_ms). "
+            "Company search restarts from page 1 for the current filter; "
+            "you may see duplicate company rows for one run."
+        )
+        STATE = singer.set_offset(STATE, 'companies', 'after', None)
         singer.write_state(STATE)
     return STATE
 
@@ -229,6 +259,45 @@ def _clear_legacy_engagement_v1_offset(STATE):
         STATE = singer.clear_offset(STATE, 'engagements')
         singer.write_state(STATE)
     return STATE
+
+
+def _repair_engagements_search_cursor_without_segment_max(STATE):
+    """HubSpot search cursor without segment_max_ms cannot recover from the ~10k page limit."""
+    raw = singer.get_bookmark(STATE, 'engagements', 'search_cursor')
+    if not raw:
+        return STATE
+    try:
+        cur = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return STATE
+    if not isinstance(cur, dict):
+        return STATE
+    if cur.get('after') and cur.get('segment_max_ms') is None:
+        LOGGER.warning(
+            "Clearing engagements search_cursor.after (missing segment_max_ms). "
+            "CRM v3 search for this activity type restarts from page 1; "
+            "you may see duplicate engagement rows for one run."
+        )
+        cur.pop('after', None)
+        STATE = singer.write_bookmark(
+            STATE, 'engagements', 'search_cursor', json.dumps(cur))
+        singer.write_state(STATE)
+    return STATE
+
+
+def _engagements_write_search_cursor(STATE, object_type, type_filter_ms, after,
+                                     segment_max_ms):
+    """Persist engagements CRM v3 search position (after ~10k rollover recovery)."""
+    payload = {
+        'object_type': object_type,
+        'filter_ms': type_filter_ms,
+    }
+    if after is not None:
+        payload['after'] = after
+    if segment_max_ms is not None:
+        payload['segment_max_ms'] = str(segment_max_ms)
+    return singer.write_bookmark(
+        STATE, 'engagements', 'search_cursor', json.dumps(payload))
 
 
 def get_field_type_schema(field_type):
@@ -733,16 +802,28 @@ def sync_companies(STATE, ctx):
     singer.write_state(STATE)
 
     STATE = _clear_legacy_company_paged_offset(STATE)
-    filter_ms = str(int(start.timestamp() * 1000))
+    STATE = _repair_company_search_cursor_without_segment_max(STATE)
+    base_filter_ms = str(int(start.timestamp() * 1000))
     search_limit = int(
         CONFIG.get('companies_search_limit')
         or default_company_params.get('search_limit', 200))
     search_url = get_url("companies_search")
+    saved_for_filter = singer.get_offset(STATE, 'companies') or {}
+    filter_ms = saved_for_filter.get('search_filter_ms') or base_filter_ms
+    if saved_for_filter.get('search_filter_ms'):
+        LOGGER.info(
+            "sync_companies: resuming CRM v3 search segment "
+            "hs_lastmodifieddate GTE %s ms (base bookmark %s ms)",
+            filter_ms,
+            base_filter_ms,
+        )
     LOGGER.info(
         "sync_companies: CRM v3 POST companies/search hs_lastmodifieddate GTE %s ms limit=%d",
         filter_ms,
         search_limit,
     )
+    progress_interval = int(CONFIG.get('companies_progress_log_interval', 50))
+    sync_started = time.monotonic()
     max_bk_value = start
     if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
         contacts_by_company_schema = load_schema(CONTACTS_BY_COMPANY)
@@ -750,10 +831,28 @@ def sync_companies(STATE, ctx):
                             "company-id", "contact-id"])
 
     companies_list_rows = 0
+    companies_detail_fetches = 0
+    search_page_num = 0
     with bumble_bee:
         saved = singer.get_offset(STATE, 'companies') or {}
         after = saved.get('after')
+        segment_max_ms = None
+        if saved.get('segment_max_ms') is not None:
+            try:
+                segment_max_ms = int(saved['segment_max_ms'])
+            except (TypeError, ValueError):
+                segment_max_ms = None
         while True:
+            search_page_num += 1
+            after_hint = "start"
+            if after is not None:
+                s = str(after)
+                after_hint = s if len(s) <= 40 else s[:37] + "..."
+            LOGGER.info(
+                "sync_companies: CRM v3 search page %d (after=%s)",
+                search_page_num,
+                after_hint,
+            )
             body = {
                 "filterGroups": [{
                     "filters": [{
@@ -771,9 +870,57 @@ def sync_companies(STATE, ctx):
             }
             if after:
                 body["after"] = after
-            resp = post_search_endpoint(search_url, body)
+            try:
+                resp = post_search_endpoint(search_url, body)
+            except requests.exceptions.HTTPError as err:
+                # HubSpot caps cursor pagination at ~10k results per query; roll forward
+                # the time filter (keyset) and restart without `after`.
+                if (err.response is not None
+                        and err.response.status_code == 400
+                        and after is not None):
+                    sms = segment_max_ms
+                    if sms is None and saved.get('segment_max_ms') is not None:
+                        try:
+                            sms = int(saved['segment_max_ms'])
+                        except (TypeError, ValueError):
+                            sms = None
+                    if sms is None:
+                        LOGGER.warning(
+                            "CRM v3 companies/search 400 with no segment_max_ms in state "
+                            "(likely offset from before this tap version). "
+                            "Clear bookmarks.companies.offset in state and rerun; "
+                            "the next sync will restart company search from the bookmark."
+                        )
+                        raise
+                    LOGGER.warning(
+                        "CRM v3 companies/search hit ~10k pagination limit; "
+                        "continuing with hs_lastmodifieddate GTE %s ms (was after=%s)",
+                        sms + 1,
+                        after_hint,
+                    )
+                    filter_ms = str(sms + 1)
+                    after = None
+                    segment_max_ms = None
+                    search_page_num = 0
+                    STATE = singer.set_offset(
+                        STATE, 'companies', 'search_filter_ms', filter_ms)
+                    STATE = singer.set_offset(STATE, 'companies', 'after', None)
+                    STATE = singer.set_offset(
+                        STATE, 'companies', 'segment_max_ms', None)
+                    singer.write_state(STATE)
+                    saved = singer.get_offset(STATE, 'companies') or {}
+                    continue
+                raise
             data = resp.json()
             results = data.get('results') or []
+            page_max_ms = _max_hs_lastmodified_ms_from_v3_results(results)
+            if page_max_ms is not None:
+                segment_max_ms = (page_max_ms if segment_max_ms is None
+                                  else max(segment_max_ms, page_max_ms))
+            if segment_max_ms is not None:
+                STATE = singer.set_offset(
+                    STATE, 'companies', 'segment_max_ms', str(segment_max_ms))
+                singer.write_state(STATE)
             with metrics.record_counter('companies') as counter:
                 for row in results:
                     counter.increment()
@@ -794,9 +941,23 @@ def sync_companies(STATE, ctx):
                             lift_properties_and_versions(record), schema, mdata)
                         singer.write_record("companies", record, catalog.get(
                             'stream_alias'), time_extracted=utils.now())
+                        companies_detail_fetches += 1
                         if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
                             STATE = _sync_contacts_by_company(
                                 STATE, ctx, record['companyId'])
+                        if (progress_interval > 0
+                                and companies_detail_fetches % progress_interval == 0):
+                            elapsed = time.monotonic() - sync_started
+                            LOGGER.info(
+                                "sync_companies: progress detail_fetches=%d "
+                                "search_rows_seen=%d page=%d company_id=%s "
+                                "elapsed=%.1fs",
+                                companies_detail_fetches,
+                                companies_list_rows,
+                                search_page_num,
+                                company_id,
+                                elapsed,
+                            )
 
             paging = data.get('paging') or {}
             next_after = paging.get('next', {}).get('after')
@@ -807,10 +968,14 @@ def sync_companies(STATE, ctx):
             after = next_after
             STATE = singer.set_offset(STATE, 'companies', 'after', after)
             singer.write_state(STATE)
+            saved = singer.get_offset(STATE, 'companies') or {}
 
     LOGGER.info(
-        "sync_companies: CRM v3 search returned %d company row(s) across all pages",
+        "sync_companies: CRM v3 search returned %d company row(s) across all pages; "
+        "%d detail fetch(es) emitted elapsed=%.1fs",
         companies_list_rows,
+        companies_detail_fetches,
+        time.monotonic() - sync_started,
     )
 
     # Don't bookmark past the start of this sync to account for updated records during the sync.
@@ -1382,8 +1547,9 @@ def sync_engagements(STATE, ctx):
     singer.write_state(STATE)
 
     STATE = _clear_legacy_engagement_v1_offset(STATE)
+    STATE = _repair_engagements_search_cursor_without_segment_max(STATE)
     start_dt = utils.strptime_with_tz(start)
-    filter_ms = str(int(start_dt.timestamp() * 1000))
+    base_filter_ms = str(int(start_dt.timestamp() * 1000))
     search_limit = int(
         CONFIG.get('engagements_search_limit')
         or CONFIG.get('engagements_page_size')
@@ -1411,28 +1577,61 @@ def sync_engagements(STATE, ctx):
 
     LOGGER.info(
         "sync_engagements: CRM v3 search per activity type + v1 detail; "
-        "hs_lastmodifieddate GTE %s ms limit=%d",
-        filter_ms,
+        "hs_lastmodifieddate GTE %s ms (per-type segment; may roll forward) limit=%d",
+        base_filter_ms,
         search_limit,
     )
+    eng_progress_interval = int(CONFIG.get('engagements_progress_log_interval', 100))
+    sync_started = time.monotonic()
 
     time_extracted = utils.now()
     engagements_list_rows = 0
     engagements_emitted = 0
+    engagement_page_num = 0
 
     with Transformer(UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
         for type_idx in range(start_type_idx, len(ENGAGEMENT_V3_SEARCH_OBJECT_TYPES)):
             object_type = ENGAGEMENT_V3_SEARCH_OBJECT_TYPES[type_idx]
+            type_filter_ms = base_filter_ms
+            segment_max_ms = None
             after = resume_after if type_idx == start_type_idx else None
             resume_after = None
+            if type_idx == start_type_idx and cursor and isinstance(cursor, dict):
+                try:
+                    if cursor.get('object_type') == object_type:
+                        type_filter_ms = cursor.get('filter_ms') or base_filter_ms
+                        if cursor.get('segment_max_ms') is not None:
+                            try:
+                                segment_max_ms = int(cursor['segment_max_ms'])
+                            except (TypeError, ValueError):
+                                segment_max_ms = None
+                except (KeyError, TypeError):
+                    pass
             search_url = _crm_v3_object_search_url(object_type)
+            LOGGER.info(
+                "sync_engagements: starting object_type=%s filter_ms=%s",
+                object_type,
+                type_filter_ms,
+            )
+            engagement_page_num = 0
             while True:
+                engagement_page_num += 1
+                after_hint = "start"
+                if after is not None:
+                    s = str(after)
+                    after_hint = s if len(s) <= 40 else s[:37] + "..."
+                LOGGER.info(
+                    "sync_engagements: CRM v3 search page object_type=%s page=%d after=%s",
+                    object_type,
+                    engagement_page_num,
+                    after_hint,
+                )
                 body = {
                     "filterGroups": [{
                         "filters": [{
                             "propertyName": "hs_lastmodifieddate",
                             "operator": "GTE",
-                            "value": filter_ms
+                            "value": type_filter_ms
                         }]
                     }],
                     "limit": search_limit,
@@ -1448,6 +1647,51 @@ def sync_engagements(STATE, ctx):
                     resp = post_search_endpoint(search_url, body)
                 except requests.exceptions.HTTPError as err:
                     if err.response is not None and err.response.status_code == 400:
+                        if after is not None:
+                            sms = segment_max_ms
+                            if sms is None and cursor and isinstance(cursor, dict):
+                                if (cursor.get('object_type') == object_type
+                                        and cursor.get('segment_max_ms') is not None):
+                                    try:
+                                        sms = int(cursor['segment_max_ms'])
+                                    except (TypeError, ValueError):
+                                        sms = None
+                            if sms is None:
+                                cur_raw = singer.get_bookmark(
+                                    STATE, 'engagements', 'search_cursor')
+                                if cur_raw:
+                                    try:
+                                        cur2 = json.loads(cur_raw)
+                                        if (isinstance(cur2, dict)
+                                                and cur2.get('object_type') == object_type
+                                                and cur2.get('segment_max_ms') is not None):
+                                            sms = int(cur2['segment_max_ms'])
+                                    except (json.JSONDecodeError, TypeError, ValueError):
+                                        pass
+                            if sms is None:
+                                LOGGER.warning(
+                                    "CRM v3 engagements/search 400 with no segment_max_ms; "
+                                    "cannot roll segment for %s. "
+                                    "Clear engagements search_cursor in state and retry.",
+                                    object_type,
+                                )
+                                raise
+                            LOGGER.warning(
+                                "CRM v3 engagements/search hit ~10k pagination limit for "
+                                "object_type=%s; continuing with hs_lastmodifieddate GTE %s ms "
+                                "(was after=%s)",
+                                object_type,
+                                sms + 1,
+                                after_hint,
+                            )
+                            type_filter_ms = str(sms + 1)
+                            after = None
+                            segment_max_ms = None
+                            engagement_page_num = 0
+                            STATE = _engagements_write_search_cursor(
+                                STATE, object_type, type_filter_ms, None, None)
+                            singer.write_state(STATE)
+                            continue
                         LOGGER.warning(
                             "CRM v3 search skipped for object type %s: %s",
                             object_type, err)
@@ -1455,6 +1699,14 @@ def sync_engagements(STATE, ctx):
                     raise
                 data = resp.json()
                 results = data.get('results') or []
+                page_max_ms = _max_hs_lastmodified_ms_from_v3_results(results)
+                if page_max_ms is not None:
+                    segment_max_ms = (page_max_ms if segment_max_ms is None
+                                      else max(segment_max_ms, page_max_ms))
+                if segment_max_ms is not None:
+                    STATE = _engagements_write_search_cursor(
+                        STATE, object_type, type_filter_ms, after, segment_max_ms)
+                    singer.write_state(STATE)
                 with metrics.record_counter('engagements') as counter:
                     for r in results:
                         counter.increment()
@@ -1480,25 +1732,35 @@ def sync_engagements(STATE, ctx):
                                 'stream_alias'), time_extracted=time_extracted)
                             if record['engagement'][bookmark_key] >= max_bk_value:
                                 max_bk_value = record['engagement'][bookmark_key]
+                        if (eng_progress_interval > 0
+                                and engagements_list_rows % eng_progress_interval == 0):
+                            elapsed = time.monotonic() - sync_started
+                            LOGGER.info(
+                                "sync_engagements: progress search_rows=%d emitted=%d "
+                                "object_type=%s page=%d last_engagement_id=%s elapsed=%.1fs",
+                                engagements_list_rows,
+                                engagements_emitted,
+                                object_type,
+                                engagement_page_num,
+                                eid,
+                                elapsed,
+                            )
 
                 paging = data.get('paging') or {}
                 next_after = paging.get('next', {}).get('after')
                 if not next_after:
                     break
                 after = next_after
-                STATE = singer.write_bookmark(
-                    STATE, 'engagements', 'search_cursor',
-                    json.dumps({
-                        'object_type': object_type,
-                        'after': after
-                    }))
+                STATE = _engagements_write_search_cursor(
+                    STATE, object_type, type_filter_ms, after, segment_max_ms)
                 singer.write_state(STATE)
 
     LOGGER.info(
         "sync_engagements: CRM v3 search + v1 detail processed %d row(s); "
-        "%d record(s) emitted after bookmark filter",
+        "%d record(s) emitted after bookmark filter elapsed=%.1fs",
         engagements_list_rows,
         engagements_emitted,
+        time.monotonic() - sync_started,
     )
 
     STATE = singer.write_bookmark(STATE, 'engagements', 'search_cursor', None)
