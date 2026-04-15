@@ -443,14 +443,26 @@ def giveup(exc):
 
 
 def on_giveup(details):
-    if len(details['args']) == 2:
-        url, params = details['args']
-    else:
-        url = details['args']
-        params = {}
+    """Log terminal backoff; do not raise here.
 
-    raise Exception("Giving up on request after {} tries with url {} and params {}"
-                    .format(details['tries'], url, params))
+    Backoff's retry_exception re-raises the original exception after this handler.
+    Raising a new Exception would replace HTTPError and break callers that catch
+    HTTPError (e.g. CRM v3 search ~10k cursor recovery).
+    """
+    args = details['args']
+    if len(args) == 2:
+        url, params = args[0], args[1]
+    elif len(args) == 1:
+        url, params = args[0], {}
+    else:
+        url, params = None, {}
+
+    LOGGER.error(
+        "Giving up on request after %s tries with url %s and params %s",
+        details['tries'],
+        url,
+        params,
+    )
 
 
 URL_SOURCE_RE = re.compile(BASE_URL + r'/(\w+)/')
