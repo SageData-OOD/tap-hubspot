@@ -7,6 +7,8 @@
   "request_timeout": 300,
   "disable_collection": false,
   "companies_search_limit": 200,
+  "companies_use_v3_batch_read": true,
+  "companies_batch_property_chunk_size": 200,
   "engagements_search_limit": 200,
   "companies_progress_log_interval": 50,
   "engagements_progress_log_interval": 100

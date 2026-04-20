@@ -76,6 +76,11 @@ CONFIG = {
     # Log INFO progress every N company detail fetches / engagement rows (0 = off)
     "companies_progress_log_interval": 50,
     "engagements_progress_log_interval": 100,
+    # Use POST /crm/v3/objects/companies/batch/read (up to 100 ids per call) instead of
+    # one v2 GET per company — much faster for large portals.
+    "companies_use_v3_batch_read": True,
+    # Max property names per batch/read body chunk (split when HubSpot rejects large payloads).
+    "companies_batch_property_chunk_size": 200,
 }
 
 ENDPOINTS = {
@@ -88,6 +93,7 @@ ENDPOINTS = {
     "companies_all":        "/companies/v2/companies/paged",
     "companies_recent":     "/companies/v2/companies/recent/modified",
     "companies_search":     "/crm/v3/objects/companies/search",
+    "companies_v3_batch_read": "/crm/v3/objects/companies/batch/read",
     "companies_detail":     "/companies/v2/companies/{company_id}",
     "contacts_by_company":  "/companies/v2/companies/{company_id}/vids",
 
@@ -224,6 +230,66 @@ def _max_hs_lastmodified_ms_from_v3_results(results):
             ms = int(dt.timestamp() * 1000)
             max_ms = ms if max_ms is None else max(max_ms, ms)
     return max_ms
+
+
+def _company_schema_property_names(schema):
+    """HubSpot CRM property names from the loaded companies schema (custom + standard)."""
+    nested = (
+        schema.get('properties', {})
+        .get('properties', {})
+        .get('properties', {})
+    )
+    if not nested:
+        return []
+    return list(nested.keys())
+
+
+def _chunks(seq, size):
+    """Yield consecutive chunks from seq (last chunk may be shorter)."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _v3_company_row_to_v2_record(v3_row):
+    """Shape CRM v3 batch/read row like v2 GET for lift_properties_and_versions."""
+    flat = v3_row.get('properties') or {}
+    props = {}
+    for k, v in flat.items():
+        if v is None:
+            continue
+        props[k] = {'value': v}
+    return {
+        'companyId': int(v3_row['id']),
+        'portalId': None,
+        'properties': props,
+    }
+
+
+def _fetch_companies_v3_batch_read(company_ids, property_names, prop_chunk_size):
+    """
+    CRM v3 batch read for up to 100 company ids; merges property chunks into one row per id.
+    """
+    if not company_ids:
+        return {}
+    if len(company_ids) > 100:
+        raise ValueError("companies batch read allows at most 100 ids per request")
+    cid_strs = [str(x) for x in company_ids]
+    merged = {int(cid): {'id': cid, 'properties': {}} for cid in cid_strs}
+    inputs = [{'id': cid} for cid in cid_strs]
+    if not property_names:
+        property_names = ['hs_lastmodifieddate', 'createdate']
+    for prop_chunk in _chunks(property_names, prop_chunk_size):
+        if not prop_chunk:
+            continue
+        body = {'inputs': inputs, 'properties': prop_chunk}
+        resp = post_search_endpoint(
+            get_url('companies_v3_batch_read'), body)
+        for item in resp.json().get('results') or []:
+            cid = int(item['id'])
+            if cid not in merged:
+                merged[cid] = {'id': item['id'], 'properties': {}}
+            merged[cid]['properties'].update(item.get('properties') or {})
+    return merged
 
 
 def _clear_legacy_company_paged_offset(STATE):
@@ -846,6 +912,35 @@ def sync_companies(STATE, ctx):
     companies_detail_fetches = 0
     search_page_num = 0
     with bumble_bee:
+        company_property_names = _company_schema_property_names(schema)
+        batch_prop_chunk = int(
+            CONFIG.get('companies_batch_property_chunk_size', 200))
+        use_v3_batch = CONFIG.get('companies_use_v3_batch_read', True)
+
+        def emit_company_record(record, company_id):
+            nonlocal STATE, companies_detail_fetches
+            record = bumble_bee.transform(
+                lift_properties_and_versions(record), schema, mdata)
+            singer.write_record("companies", record, catalog.get(
+                'stream_alias'), time_extracted=utils.now())
+            companies_detail_fetches += 1
+            if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
+                STATE = _sync_contacts_by_company(
+                    STATE, ctx, record['companyId'])
+            if (progress_interval > 0
+                    and companies_detail_fetches % progress_interval == 0):
+                elapsed = time.monotonic() - sync_started
+                LOGGER.info(
+                    "sync_companies: progress detail_fetches=%d "
+                    "search_rows_seen=%d page=%d company_id=%s "
+                    "elapsed=%.1fs",
+                    companies_detail_fetches,
+                    companies_list_rows,
+                    search_page_num,
+                    company_id,
+                    elapsed,
+                )
+
         saved = singer.get_offset(STATE, 'companies') or {}
         after = saved.get('after')
         segment_max_ms = None
@@ -934,6 +1029,7 @@ def sync_companies(STATE, ctx):
                     STATE, 'companies', 'segment_max_ms', str(segment_max_ms))
                 singer.write_state(STATE)
             with metrics.record_counter('companies') as counter:
+                rows_to_emit = []
                 for row in results:
                     counter.increment()
                     companies_list_rows += 1
@@ -946,30 +1042,50 @@ def sync_companies(STATE, ctx):
                         max_bk_value = modified_time
 
                     if not modified_time or modified_time >= start:
+                        rows_to_emit.append((row, company_id))
+
+                if not rows_to_emit:
+                    pass
+                elif use_v3_batch and company_property_names:
+                    try:
+                        for i in range(0, len(rows_to_emit), 100):
+                            batch = rows_to_emit[i:i + 100]
+                            ids = [cid for _, cid in batch]
+                            merged = _fetch_companies_v3_batch_read(
+                                ids, company_property_names, batch_prop_chunk)
+                            for _, company_id in batch:
+                                v3_row = merged.get(company_id)
+                                if not v3_row:
+                                    LOGGER.warning(
+                                        "sync_companies: company %s missing from "
+                                        "batch/read; using v2 GET",
+                                        company_id)
+                                    record = request(
+                                        get_url("companies_detail",
+                                                company_id=company_id)
+                                    ).json()
+                                    emit_company_record(record, company_id)
+                                    continue
+                                record = _v3_company_row_to_v2_record(v3_row)
+                                emit_company_record(record, company_id)
+                    except requests.exceptions.HTTPError as err:
+                        LOGGER.warning(
+                            "CRM v3 companies/batch/read failed (%s); "
+                            "using per-company v2 GET for this search page",
+                            err,
+                        )
+                        for _, company_id in rows_to_emit:
+                            record = request(
+                                get_url("companies_detail",
+                                        company_id=company_id)
+                            ).json()
+                            emit_company_record(record, company_id)
+                else:
+                    for _, company_id in rows_to_emit:
                         record = request(
                             get_url("companies_detail", company_id=company_id)
                         ).json()
-                        record = bumble_bee.transform(
-                            lift_properties_and_versions(record), schema, mdata)
-                        singer.write_record("companies", record, catalog.get(
-                            'stream_alias'), time_extracted=utils.now())
-                        companies_detail_fetches += 1
-                        if CONTACTS_BY_COMPANY in ctx.selected_stream_ids:
-                            STATE = _sync_contacts_by_company(
-                                STATE, ctx, record['companyId'])
-                        if (progress_interval > 0
-                                and companies_detail_fetches % progress_interval == 0):
-                            elapsed = time.monotonic() - sync_started
-                            LOGGER.info(
-                                "sync_companies: progress detail_fetches=%d "
-                                "search_rows_seen=%d page=%d company_id=%s "
-                                "elapsed=%.1fs",
-                                companies_detail_fetches,
-                                companies_list_rows,
-                                search_page_num,
-                                company_id,
-                                elapsed,
-                            )
+                        emit_company_record(record, company_id)
 
             paging = data.get('paging') or {}
             next_after = paging.get('next', {}).get('after')
